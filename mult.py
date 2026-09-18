@@ -8,12 +8,15 @@ Características:
 - Patrón visual de puntos para entender la multiplicación
 - Repetición espaciada: las multiplicaciones que más se fallan aparecen más seguido
 - Racha de aciertos y progreso persistente entre sesiones (se guarda en un archivo JSON local)
+- Repaso automático: tras 4 errores seguidos aparece la tabla completa
+- Modo avanzado (opcional): multiplicación inversa, problemas con contexto y tiempo límite
 """
 
 import streamlit as st
 import json
 import os
 import random
+import time
 
 # ----------------------------------------------------------------------
 # Configuración y persistencia
@@ -22,7 +25,17 @@ import random
 DATA_FILE = "progreso_tablas.json"
 TABLAS = list(range(2, 11))
 UMBRAL_DOMINIO = 8          # aciertos consecutivos necesarios para dominar una tabla
-PREGUNTAS_POR_TANDA = 10
+LIMITE_ERRORES_SESION = 4   # errores seguidos antes de mostrar la tabla completa de repaso
+LIMITE_TIEMPO_SEGUNDOS = 12  # tiempo límite por pregunta en modo avanzado
+
+PLANTILLAS_PROBLEMA = [
+    "Cada caja tiene {b} manzanas. Si hay {a} cajas, ¿cuántas manzanas hay en total?",
+    "Un estante tiene {a} filas de libros, con {b} libros en cada fila. ¿Cuántos libros hay en total?",
+    "En el salón hay {a} mesas, cada una con {b} sillas. ¿Cuántas sillas hay en total?",
+    "Cada semana ahorras {b} monedas. ¿Cuántas monedas habrás ahorrado después de {a} semanas?",
+    "Un jardín tiene {a} macetas, cada una con {b} flores. ¿Cuántas flores hay en total?",
+    "En cada bolsa hay {b} caramelos. Si compras {a} bolsas, ¿cuántos caramelos tienes en total?",
+]
 
 
 def cargar_progreso():
@@ -68,7 +81,14 @@ if "errores_sesion" not in st.session_state:
 if "mostrar_tabla_completa" not in st.session_state:
     st.session_state.mostrar_tabla_completa = False
 
-LIMITE_ERRORES_SESION = 4
+if "modo_avanzado" not in st.session_state:
+    st.session_state.modo_avanzado = False
+
+if "tiempo_inicio" not in st.session_state:
+    st.session_state.tiempo_inicio = None
+
+if "tiempo_agotado" not in st.session_state:
+    st.session_state.tiempo_agotado = False
 
 
 # ----------------------------------------------------------------------
@@ -111,6 +131,16 @@ st.markdown("""
         font-size: 0.75rem;
         font-weight: 600;
     }
+    .badge-avanzado {
+        display: inline-block;
+        background-color: #EEF2FF;
+        color: #4F46E5;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 2px 10px;
+        border-radius: 999px;
+        margin-bottom: 1rem;
+    }
     .stButton>button {
         border-radius: 6px;
         border: 1px solid #4F46E5;
@@ -134,21 +164,45 @@ st.markdown("""
 
 
 # ----------------------------------------------------------------------
-# Lógica de preguntas (repetición espaciada simplificada)
+# Lógica de preguntas (repetición espaciada + tipos de pregunta)
 # ----------------------------------------------------------------------
 
-def elegir_pregunta(tabla):
-    """Elige un multiplicador (1-10) para la tabla dada, dando más peso
-    a las combinaciones que se han fallado más veces."""
+def elegir_multiplicador(tabla):
+    """Elige un multiplicador (1-10), dando más peso a las combinaciones
+    que se han fallado más veces (repetición espaciada)."""
     progreso = st.session_state.progreso
     opciones = list(range(1, 11))
     pesos = []
     for n in opciones:
         clave = f"{tabla}_{n}"
         fallos = progreso["errores"].get(clave, 0)
-        pesos.append(1 + fallos * 3)  # más fallos, más probabilidad de repetirse
-    elegido = random.choices(opciones, weights=pesos, k=1)[0]
-    return elegido
+        pesos.append(1 + fallos * 3)
+    return random.choices(opciones, weights=pesos, k=1)[0]
+
+
+def generar_pregunta(tabla):
+    """Genera una pregunta nueva. En modo avanzado puede ser normal,
+    inversa (falta un factor) o un problema con contexto."""
+    n = elegir_multiplicador(tabla)
+    producto = tabla * n
+
+    if st.session_state.modo_avanzado:
+        tipo = random.choice(["inversa", "problema"])
+    else:
+        tipo = "normal"
+
+    if tipo == "normal":
+        texto = f"¿Cuánto es {tabla} × {n}?"
+        respuesta = producto
+    elif tipo == "inversa":
+        texto = f"{tabla} × ___ = {producto}. ¿Qué número falta?"
+        respuesta = n
+    else:  # problema
+        plantilla = random.choice(PLANTILLAS_PROBLEMA)
+        texto = plantilla.format(a=tabla, b=n)
+        respuesta = producto
+
+    return {"tabla": tabla, "n": n, "tipo": tipo, "texto": texto, "respuesta": respuesta}
 
 
 def registrar_resultado(tabla, multiplicador, correcto):
@@ -158,14 +212,12 @@ def registrar_resultado(tabla, multiplicador, correcto):
     if correcto:
         progreso["racha_actual"][str(tabla)] += 1
         progreso["estrellas"] += 1
-        # reduce un poco el contador de errores de esa combinación si existía
         if clave in progreso["errores"] and progreso["errores"][clave] > 0:
             progreso["errores"][clave] -= 1
     else:
         progreso["racha_actual"][str(tabla)] = 0
         progreso["errores"][clave] = progreso["errores"].get(clave, 0) + 1
 
-    # ¿Se domina la tabla?
     if progreso["racha_actual"][str(tabla)] >= UMBRAL_DOMINIO and tabla not in progreso["dominadas"]:
         progreso["dominadas"].append(tabla)
         siguiente = tabla + 1
@@ -202,6 +254,14 @@ def dibujar_patron(a, b):
     return filas
 
 
+def iniciar_pregunta(tabla):
+    """Genera una pregunta nueva y reinicia el cronómetro."""
+    st.session_state.pregunta_actual = generar_pregunta(tabla)
+    st.session_state.mostrar_resultado = False
+    st.session_state.tiempo_inicio = time.time()
+    st.session_state.tiempo_agotado = False
+
+
 # ----------------------------------------------------------------------
 # Pantalla: Menú principal
 # ----------------------------------------------------------------------
@@ -216,6 +276,13 @@ def pantalla_menu():
     st.progress(total_dominadas / len(TABLAS))
     st.caption(f"Progreso: {total_dominadas} de {len(TABLAS)} tablas dominadas  ·  ⭐ {progreso['estrellas']} puntos")
 
+    st.write("")
+    nuevo_valor = st.toggle(
+        "Modo avanzado (multiplicación inversa, problemas y tiempo límite)",
+        value=st.session_state.modo_avanzado,
+        key="chk_modo_avanzado",
+    )
+    st.session_state.modo_avanzado = nuevo_valor
     st.write("")
 
     cols = st.columns(3)
@@ -238,9 +305,10 @@ def pantalla_menu():
             if desbloqueada:
                 if st.button("Practicar", key=f"btn_{tabla}"):
                     st.session_state.tabla_actual = tabla
-                    st.session_state.pregunta_actual = elegir_pregunta(tabla)
-                    st.session_state.mostrar_resultado = False
                     st.session_state.mostrar_patron = False
+                    st.session_state.errores_sesion[tabla] = 0
+                    st.session_state.mostrar_tabla_completa = False
+                    iniciar_pregunta(tabla)
                     st.session_state.pantalla = "practica"
                     st.rerun()
 
@@ -254,7 +322,8 @@ def pantalla_menu():
 def pantalla_practica():
     progreso = st.session_state.progreso
     tabla = st.session_state.tabla_actual
-    n = st.session_state.pregunta_actual
+    pregunta = st.session_state.pregunta_actual
+    n = pregunta["n"]
 
     col_a, col_b = st.columns([1, 4])
     with col_a:
@@ -264,6 +333,9 @@ def pantalla_practica():
 
     st.markdown(f'<div class="titulo-app">Tabla del {tabla}</div>', unsafe_allow_html=True)
 
+    if st.session_state.modo_avanzado:
+        st.markdown('<span class="badge-avanzado">Modo avanzado</span>', unsafe_allow_html=True)
+
     racha = progreso["racha_actual"][str(tabla)]
     errores_actuales = st.session_state.errores_sesion[tabla]
     st.caption(
@@ -272,21 +344,34 @@ def pantalla_practica():
     )
 
     st.write("")
-    st.markdown(f"### ¿Cuánto es {tabla} × {n}?")
+    st.markdown(f"### {pregunta['texto']}")
 
-    if st.checkbox("Ver patrón visual", value=st.session_state.mostrar_patron, key="chk_patron"):
-        st.session_state.mostrar_patron = True
-        st.markdown(dibujar_patron(tabla, n), unsafe_allow_html=True)
-    else:
-        st.session_state.mostrar_patron = False
+    if st.session_state.modo_avanzado and not st.session_state.mostrar_resultado:
+        st.caption(f"⏱ Tienes {LIMITE_TIEMPO_SEGUNDOS} segundos para responder")
 
-    respuesta = st.number_input("Tu respuesta", min_value=0, max_value=200, step=1, key=f"input_{tabla}_{n}")
+    # El patrón visual solo tiene sentido para la pregunta "normal"
+    if pregunta["tipo"] == "normal":
+        if st.checkbox("Ver patrón visual", value=st.session_state.mostrar_patron, key="chk_patron"):
+            st.session_state.mostrar_patron = True
+            st.markdown(dibujar_patron(tabla, n), unsafe_allow_html=True)
+        else:
+            st.session_state.mostrar_patron = False
+
+    respuesta = st.number_input(
+        "Tu respuesta", min_value=0, max_value=200, step=1,
+        key=f"input_{tabla}_{n}_{pregunta['tipo']}"
+    )
 
     if st.button("Comprobar"):
-        correcto = (respuesta == tabla * n)
+        elapsed = time.time() - (st.session_state.tiempo_inicio or time.time())
+        tiempo_agotado = st.session_state.modo_avanzado and elapsed > LIMITE_TIEMPO_SEGUNDOS
+
+        correcto = (not tiempo_agotado) and (respuesta == pregunta["respuesta"])
+
         registrar_resultado(tabla, n, correcto)
         st.session_state.progreso = cargar_progreso()  # refresca desde disco
         st.session_state.resultado_correcto = correcto
+        st.session_state.tiempo_agotado = tiempo_agotado
         st.session_state.mostrar_resultado = True
 
         if correcto:
@@ -300,21 +385,23 @@ def pantalla_practica():
     if st.session_state.mostrar_resultado:
         if st.session_state.resultado_correcto:
             st.success(f"Correcto: {tabla} × {n} = {tabla * n}")
+        elif st.session_state.tiempo_agotado:
+            st.error(f"¡Se acabó el tiempo! {tabla} × {n} = {tabla * n}")
         else:
             st.error(f"No es correcto. {tabla} × {n} = {tabla * n}")
+
+
 
         if st.session_state.mostrar_tabla_completa:
             st.warning(f"Repasemos la tabla del {tabla} completa antes de seguir:")
             st.markdown(dibujar_tabla_completa(tabla), unsafe_allow_html=True)
             if st.button("Entendido, seguir practicando"):
                 st.session_state.mostrar_tabla_completa = False
-                st.session_state.pregunta_actual = elegir_pregunta(tabla)
-                st.session_state.mostrar_resultado = False
+                iniciar_pregunta(tabla)
                 st.rerun()
         else:
             if st.button("Siguiente pregunta"):
-                st.session_state.pregunta_actual = elegir_pregunta(tabla)
-                st.session_state.mostrar_resultado = False
+                iniciar_pregunta(tabla)
                 st.rerun()
 
 
